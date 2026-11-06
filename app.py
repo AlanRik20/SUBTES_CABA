@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 import folium
-import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -26,9 +25,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DASHBOARD_PATH = DATA_DIR / "dashboard.json"
+DATA_JSON = Path("dashboard_data.json")
 
 URL_ESTACIONES = (
     "https://cdn.buenosaires.gob.ar/datosabiertos/datasets/sbase/"
@@ -48,21 +45,7 @@ COLORES_LINEAS = {
     "H": "#F2CF00",
 }
 
-COLUMNAS_BASE = [
-    "FECHA_DT", "HORA", "LINEA", "ESTACION", "PASAJEROS_REALES",
-    "PRED_REGRESION_LINEAL", "PRED_RANDOM_FOREST",
-    "PRED_GRADIENT_BOOSTING", "PRED_BASELINE",
-]
-COLUMNAS_PREDICCION = {
-    "Demanda real observada": "PASAJEROS_REALES",
-    "Regresión Lineal": "PRED_REGRESION_LINEAL",
-    "Random Forest": "PRED_RANDOM_FOREST",
-    "Gradient Boosting": "PRED_GRADIENT_BOOSTING",
-    "Baseline histórico": "PRED_BASELINE",
-}
-
 # Equivalencias entre los nombres del GeoJSON y los usados en los molinetes.
-# La búsqueda se restringe a la misma línea para evitar asociaciones incorrectas.
 ALIAS_ESTACIONES = {
     "R SCALABRINI ORTIZ": ["SCALABRINI ORTIZ", "RAUL SCALABRINI ORTIZ"],
     "C PELLEGRINI": ["CARLOS PELLEGRINI"],
@@ -89,7 +72,6 @@ ALIAS_ESTACIONES = {
     "RIO DE JANEIRO": ["RIO DE JANEIRO"],
 }
 
-
 def normalizar_nombre(valor: Any) -> str:
     if pd.isna(valor):
         return ""
@@ -110,58 +92,39 @@ def normalizar_linea(valor: Any) -> str:
     linea = linea.replace("LÍNEA", "").replace("LINEA", "")
     return re.sub(r"[^A-Z]", "", linea)
 
+
 # =============================================================================
-# Carga del dashboard.json
+# Carga de los datos
 # =============================================================================
 
 @st.cache_data(show_spinner="Cargando los resultados del dashboard...")
-def cargar_dashboard():
+def cargar_datos_dashboard():
+    if not DATA_JSON.exists():
+        raise FileNotFoundError(f"No se encontró {DATA_JSON.name} en el directorio.")
 
-    if not DASHBOARD_PATH.exists():
-        raise FileNotFoundError(
-            f"No se encontró dashboard.json en: {DASHBOARD_PATH}"
-        )
+    with open(DATA_JSON, "r", encoding="utf-8") as archivo:
+        datos = json.load(archivo)
 
-    try:
-        with open(DASHBOARD_PATH, "r", encoding="utf-8") as archivo:
-            datos = json.load(archivo)
+    df_estaciones = pd.DataFrame(datos["estaciones"])
+    serie_diaria = datos["serie_diaria"]
 
-    except json.JSONDecodeError as error:
-        raise ValueError(
-            f"El archivo dashboard.json no contiene un JSON válido: {error}"
-        )
+    registros = []
+    for est_id, valores in serie_diaria.items():
+        est_info = df_estaciones[df_estaciones["id"] == int(est_id)].iloc[0]
+        valores_validos = [v for v in valores if v is not None]
+        total = sum(valores_validos) if valores_validos else 0
+        promedio = (total / len(valores_validos)) if valores_validos else 0
 
-    if not isinstance(datos, dict):
-        raise ValueError("La estructura principal del JSON debe ser un objeto.")
+        registros.append({
+            "LINEA": est_info["linea"],
+            "ESTACION_BASE": est_info["nombre"],
+            "VALOR_TOTAL": total,
+            "VALOR_PROMEDIO": promedio,
+            "SERIE": valores
+        })
 
-    if datos.get("version") != 2:
-        raise ValueError(
-            f"Versión de dashboard no compatible: {datos.get('version')}"
-        )
+    return pd.DataFrame(registros), datos
 
-    if "estaciones" not in datos:
-        raise ValueError("El JSON no contiene la sección 'estaciones'.")
-
-    estaciones = pd.DataFrame(datos["estaciones"])
-
-    columnas_requeridas = ["id", "nombre", "linea"]
-    faltantes = [
-        columna for columna in columnas_requeridas
-        if columna not in estaciones.columns
-    ]
-
-    if faltantes:
-        raise ValueError(
-            "La sección estaciones no contiene: " + ", ".join(faltantes)
-        )
-
-    estaciones["nombre"] = estaciones["nombre"].astype(str).str.strip()
-    estaciones["linea"] = estaciones["linea"].apply(normalizar_linea)
-
-    return datos, estaciones
-# =============================================================================
-# Capas geográficas oficiales de Buenos Aires Data / SBASE
-# =============================================================================
 @st.cache_data(ttl=24 * 60 * 60, show_spinner="Cargando el mapa oficial del Subte...")
 def cargar_geojson(url: str) -> dict:
     respuesta = requests.get(url, timeout=35)
@@ -170,7 +133,6 @@ def cargar_geojson(url: str) -> dict:
     if contenido.get("type") != "FeatureCollection":
         raise ValueError("El recurso geográfico no tiene formato GeoJSON FeatureCollection.")
     return contenido
-
 
 def extraer_estaciones(geojson: dict) -> pd.DataFrame:
     filas = []
@@ -192,7 +154,6 @@ def extraer_estaciones(geojson: dict) -> pd.DataFrame:
         raise ValueError("No se encontraron estaciones en el GeoJSON oficial.")
     estaciones["ESTACION_GEO_NORM"] = estaciones["ESTACION_GEO"].apply(normalizar_nombre)
     return estaciones
-
 
 def encontrar_nombre_base(nombre_geo: str, linea: str, nombres_por_linea: dict) -> str | None:
     candidatos = nombres_por_linea.get(linea, [])
@@ -227,12 +188,11 @@ def encontrar_nombre_base(nombre_geo: str, linea: str, nombres_por_linea: dict) 
             mejor_nombre = candidato
     return mejor_nombre if mejor_puntaje >= 0.86 else None
 
-
-def vincular_estaciones(estaciones: pd.DataFrame, pred: pd.DataFrame) -> pd.DataFrame:
+def vincular_estaciones(estaciones: pd.DataFrame, df_demanda: pd.DataFrame) -> pd.DataFrame:
     nombres_por_linea = (
-        pred[["LINEA", "ESTACION"]]
+        df_demanda[["LINEA", "ESTACION_BASE"]]
         .drop_duplicates()
-        .groupby("LINEA")["ESTACION"]
+        .groupby("LINEA")["ESTACION_BASE"]
         .apply(list)
         .to_dict()
     )
@@ -245,14 +205,13 @@ def vincular_estaciones(estaciones: pd.DataFrame, pred: pd.DataFrame) -> pd.Data
     )
     return resultado
 
-
 def construir_mapa(
     estaciones: pd.DataFrame,
     lineas_geojson: dict,
     demanda: pd.DataFrame,
     lineas_seleccionadas: list[str],
-    etiqueta_metrica: str,
-    tipo_agregacion: str,
+    titulo_indicador: str,
+    modo: str,
 ) -> folium.Map:
     mapa = folium.Map(
         location=[-34.608, -58.425],
@@ -302,7 +261,7 @@ def construir_mapa(
         vmin=minimo,
         vmax=maximo,
     )
-    escala.caption = f"{etiqueta_metrica} ({tipo_agregacion.lower()})"
+    escala.caption = titulo_indicador
     escala.add_to(mapa)
 
     grupo_estaciones = folium.FeatureGroup(name="Estaciones y demanda", show=True)
@@ -315,10 +274,7 @@ def construir_mapa(
 
         if tiene_datos:
             radio = 5 + 10 * math.sqrt(valor_num / maximo)
-            if tipo_agregacion == "Total del período":
-                detalle = f"{valor_num:,.0f} pasajeros"
-            else:
-                detalle = f"{valor_num:,.1f} pasajeros por registro horario"
+            detalle = f"{valor_num:,.0f} pasajeros" if modo == "total" else f"{valor_num:,.1f} pasajeros"
         else:
             radio = 5
             detalle = "Sin registros para los filtros seleccionados"
@@ -327,7 +283,7 @@ def construir_mapa(
         <div style='font-family:Arial; min-width:210px;'>
             <b>{fila['ESTACION_GEO']}</b><br>
             Línea: {fila['LINEA']}<br>
-            {etiqueta_metrica}: {detalle}
+            {titulo_indicador}: {detalle}
         </div>
         """
         folium.CircleMarker(
@@ -346,41 +302,29 @@ def construir_mapa(
     folium.LayerControl(collapsed=False).add_to(mapa)
     return mapa
 
-
 # =============================================================================
 # Interfaz principal
 # =============================================================================
-st.title("🚇 Demanda de pasajeros del Subte de Buenos Aires")
-st.markdown(
-    "Exploración geográfica y comparación de los modelos de predicción "
-    "entrenados en el notebook del Grupo 13."
-)
-st.caption(
-    "Resultados finales del conjunto de prueba: enero–junio de 2026. "
-    "Los datos se cargan automáticamente; no es necesario subir archivos."
-)
+st.title("🚇 Resultados del Modelo - Subte BA")
+st.markdown("Exploración geográfica de los datos extraídos del modelo para el período de prueba de 2026.")
 
 try:
-    dashboard, estaciones_json = cargar_dashboard()
-
-    st.success(
-        f"Dashboard cargado correctamente. "
-        f"Estaciones disponibles: {len(estaciones_json)}"
-    )
-
+    df_demanda, meta_datos = cargar_datos_dashboard()
 except Exception as exc:
-    st.error(f"No se pudo cargar dashboard.json: {exc}")
+    st.error(f"Error cargando los datos del dashboard: {exc}")
     st.stop()
 
-# Mostrar de forma visible el período realmente incluido en el archivo.
-fecha_min = df_pred["FECHA_DT"].min().date()
-fecha_max = df_pred["FECHA_DT"].max().date()
-
 with st.sidebar:
-    st.header("Filtros")
-    st.caption("Los filtros afectan al mapa y al resumen por estación.")
+    st.header("Información del Dataset")
+    st.info(
+        f"**Inicio Test:** {meta_datos.get('test_inicio', 'N/A')}\n\n"
+        f"**Días Test:** {meta_datos.get('n_dias_test', 'N/A')}\n\n"
+        f"**Horario Inicio:** {meta_datos.get('horario_inicio', 'N/A')}\n\n"
+        f"**Total Slots:** {meta_datos.get('n_slots', 'N/A')}"
+    )
 
-    lineas_disponibles = sorted(df_pred["LINEA"].dropna().unique().tolist())
+    st.header("Filtros")
+    lineas_disponibles = sorted(df_demanda["LINEA"].dropna().unique().tolist())
     lineas_seleccionadas = st.multiselect(
         "Líneas de subte",
         options=lineas_disponibles,
@@ -388,91 +332,42 @@ with st.sidebar:
         format_func=lambda x: f"Línea {x}",
     )
 
-    fechas = st.date_input(
-        "Período del conjunto de prueba",
-        value=(fecha_min, fecha_max),
-        min_value=fecha_min,
-        max_value=fecha_max,
-        format="DD/MM/YYYY",
-    )
-    if isinstance(fechas, (tuple, list)) and len(fechas) == 2:
-        fecha_inicio, fecha_fin = fechas
+    modos = ["Demanda Total (Período)", "Demanda Promedio", "Por Slot Horario"]
+    modo_elegido = st.radio("Tipo de visualización", modos, index=0)
+
+    if modo_elegido == "Por Slot Horario":
+        n_slots = meta_datos.get("n_slots", 1)
+        slot_elegido = st.slider("Seleccionar Slot", 0, n_slots - 1, 0)
+        demanda = df_demanda[["LINEA", "ESTACION_BASE"]].copy()
+        demanda["VALOR_MAPA"] = df_demanda["SERIE"].apply(
+            lambda x: x[slot_elegido] if slot_elegido < len(x) and x[slot_elegido] is not None else 0
+        )
+        modo_mapa = "slot"
+        titulo_indicador = f"Demanda Estimada (Slot {slot_elegido})"
+    elif modo_elegido == "Demanda Total (Período)":
+        demanda = df_demanda[["LINEA", "ESTACION_BASE", "VALOR_TOTAL"]].rename(columns={"VALOR_TOTAL": "VALOR_MAPA"})
+        modo_mapa = "total"
+        titulo_indicador = "Total de pasajeros estimados"
     else:
-        fecha_inicio = fecha_fin = fechas
-
-    horas_disponibles = sorted(df_pred["HORA"].dropna().astype(int).unique().tolist())
-    hora_min = min(horas_disponibles) if horas_disponibles else 0
-    hora_max = max(horas_disponibles) if horas_disponibles else 23
-    hora_inicio, hora_fin = st.slider(
-        "Franja horaria",
-        min_value=hora_min,
-        max_value=hora_max,
-        value=(hora_min, hora_max),
-        format="%d:00",
-    )
-
-    metrica_elegida = st.selectbox(
-        "Indicador para el mapa",
-        options=list(COLUMNAS_PREDICCION.keys()),
-        index=0,
-    )
-    agregacion = st.radio(
-        "Tipo de resumen",
-        options=["Total del período", "Promedio por registro horario"],
-        index=0,
-    )
+        demanda = df_demanda[["LINEA", "ESTACION_BASE", "VALOR_PROMEDIO"]].rename(columns={"VALOR_PROMEDIO": "VALOR_MAPA"})
+        modo_mapa = "promedio"
+        titulo_indicador = "Promedio de pasajeros por registro"
 
 if not lineas_seleccionadas:
     st.warning("Seleccioná al menos una línea en el panel lateral.")
     st.stop()
 
-if fecha_inicio > fecha_fin:
-    st.warning("La fecha inicial no puede ser posterior a la fecha final.")
-    st.stop()
 
-columna_metrica = COLUMNAS_PREDICCION[metrica_elegida]
-df_filtrado = df_pred[
-    df_pred["FECHA_DT"].dt.date.between(fecha_inicio, fecha_fin)
-    & df_pred["HORA"].between(hora_inicio, hora_fin)
-    & df_pred["LINEA"].isin(lineas_seleccionadas)
-].copy()
-
-# Los modelos pueden producir valores negativos. Se limitan a cero únicamente
-# para visualización, porque no existe una cantidad negativa de pasajeros.
-negativos_visuales = 0
-if columna_metrica != "PASAJEROS_REALES":
-    negativos_visuales = int((df_filtrado[columna_metrica] < 0).sum())
-    df_filtrado[columna_metrica] = df_filtrado[columna_metrica].clip(lower=0)
-
-if agregacion == "Total del período":
-    demanda = (
-        df_filtrado.groupby(["LINEA", "ESTACION"], as_index=False)[columna_metrica]
-        .sum()
-        .rename(columns={"ESTACION": "ESTACION_BASE", columna_metrica: "VALOR_MAPA"})
-    )
-else:
-    demanda = (
-        df_filtrado.groupby(["LINEA", "ESTACION"], as_index=False)[columna_metrica]
-        .mean()
-        .rename(columns={"ESTACION": "ESTACION_BASE", columna_metrica: "VALOR_MAPA"})
-    )
-
-# La geometría se descarga automáticamente desde Buenos Aires Data / SBASE.
 try:
     with st.spinner("Preparando las estaciones y recorridos oficiales..."):
         geo_estaciones = cargar_geojson(URL_ESTACIONES)
         geo_lineas = cargar_geojson(URL_LINEAS)
-        estaciones = vincular_estaciones(extraer_estaciones(geo_estaciones), df_pred)
+        estaciones = vincular_estaciones(extraer_estaciones(geo_estaciones), df_demanda)
 except Exception as exc:
-    st.error(
-        "No se pudieron obtener las capas geográficas oficiales del Subte. "
-        "La aplicación necesita conexión a internet para cargar el mapa."
-    )
-    st.caption(f"Detalle técnico: {exc}")
+    st.error("No se pudieron obtener las capas geográficas oficiales del Subte.")
     st.stop()
 
-# Indicadores generales.
-combinaciones_estacion_linea = df_pred[["LINEA", "ESTACION"]].drop_duplicates().shape[0]
+# Indicadores generales
 estaciones_vinculadas = estaciones[
     estaciones["LINEA"].isin(lineas_seleccionadas)
     & estaciones["ESTACION_BASE"].notna()
@@ -481,132 +376,60 @@ mapa_datos = estaciones[
     estaciones["LINEA"].isin(lineas_seleccionadas)
 ].merge(demanda, on=["LINEA", "ESTACION_BASE"], how="left")
 
-if agregacion == "Total del período":
+k1, k2, k3 = st.columns(3)
+k1.metric("Estaciones geográficas vinculadas", f"{len(estaciones_vinculadas)}")
+
+if modo_mapa == "total":
     valor_kpi = float(demanda["VALOR_MAPA"].sum()) if not demanda.empty else 0.0
-    formato_kpi = f"{valor_kpi:,.0f}"
-    etiqueta_kpi = "Pasajeros del indicador seleccionado"
+    k2.metric("Total acumulado", f"{valor_kpi:,.0f}")
 else:
     valor_kpi = float(demanda["VALOR_MAPA"].mean()) if not demanda.empty else 0.0
-    formato_kpi = f"{valor_kpi:,.1f}"
-    etiqueta_kpi = "Promedio por estación y registro horario"
+    k2.metric("Promedio en pantalla", f"{valor_kpi:,.1f}")
 
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Registros filtrados", f"{len(df_filtrado):,}")
-k2.metric("Líneas seleccionadas", len(lineas_seleccionadas))
-k3.metric("Estaciones geográficas vinculadas", f"{len(estaciones_vinculadas)}")
-k4.metric(etiqueta_kpi, formato_kpi)
 
-if negativos_visuales:
-    st.info(
-        f"Para esta selección se encontraron {negativos_visuales:,} predicciones negativas. "
-        "En el mapa se representan como cero pasajeros; los archivos originales no se modifican."
-    )
+st.subheader("Mapa de estaciones y demanda")
+st.caption(f"{titulo_indicador} para el período seleccionado.")
 
-pestana_mapa, pestana_comparacion = st.tabs(["🗺️ Mapa de demanda", "📈 Real vs. predicho"])
+mapa = construir_mapa(
+    estaciones=estaciones,
+    lineas_geojson=geo_lineas,
+    demanda=demanda,
+    lineas_seleccionadas=lineas_seleccionadas,
+    titulo_indicador=titulo_indicador,
+    modo=modo_mapa,
+)
+st_folium(mapa, width=None, height=690, returned_objects=[], key="mapa_subte")
 
-with pestana_mapa:
-    st.subheader("Mapa de estaciones y demanda")
-    st.caption(
-        f"{metrica_elegida} · {agregacion.lower()} · "
-        f"{fecha_inicio.strftime('%d/%m/%Y')} al {fecha_fin.strftime('%d/%m/%Y')} · "
-        f"horas {hora_inicio:02d}:00 a {hora_fin:02d}:00"
-    )
-
-    mapa = construir_mapa(
-        estaciones=estaciones,
-        lineas_geojson=geo_lineas,
-        demanda=demanda,
-        lineas_seleccionadas=lineas_seleccionadas,
-        etiqueta_metrica=metrica_elegida,
-        tipo_agregacion=agregacion,
-    )
-    st_folium(mapa, width=None, height=690, returned_objects=[], key="mapa_subte")
-
-    sin_coincidencia = estaciones[
-        estaciones["LINEA"].isin(lineas_seleccionadas)
-        & estaciones["ESTACION_BASE"].isna()
-    ]
-    if not sin_coincidencia.empty:
-        with st.expander(f"Estaciones sin coincidencia con los datos ({len(sin_coincidencia)})"):
-            st.warning(
-                "Estas estaciones están en la cartografía oficial, pero sus nombres no "
-                "se pudieron asociar automáticamente con el CSV de predicciones."
-            )
-            st.dataframe(
-                sin_coincidencia[["LINEA", "ESTACION_GEO"]]
-                .sort_values(["LINEA", "ESTACION_GEO"]),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    with st.expander("Ranking de estaciones según el indicador seleccionado"):
-        ranking = demanda.merge(
-            estaciones[["LINEA", "ESTACION_BASE", "ESTACION_GEO"]].drop_duplicates(),
-            on=["LINEA", "ESTACION_BASE"],
-            how="left",
+sin_coincidencia = estaciones[
+    estaciones["LINEA"].isin(lineas_seleccionadas)
+    & estaciones["ESTACION_BASE"].isna()
+]
+if not sin_coincidencia.empty:
+    with st.expander(f"Estaciones sin coincidencia con los datos ({len(sin_coincidencia)})"):
+        st.warning(
+            "Estas estaciones están en la cartografía oficial, pero sus nombres no "
+            "se pudieron asociar automáticamente con los datos cargados."
         )
-        ranking = ranking.sort_values("VALOR_MAPA", ascending=False)
-        ranking = ranking.rename(columns={
-            "LINEA": "Línea",
-            "ESTACION_GEO": "Estación",
-            "VALOR_MAPA": "Valor",
-        })
         st.dataframe(
-            ranking[["Línea", "Estación", "Valor"]],
+            sin_coincidencia[["LINEA", "ESTACION_GEO"]].sort_values(["LINEA", "ESTACION_GEO"]),
             use_container_width=True,
             hide_index=True,
         )
 
-with pestana_comparacion:
-    st.subheader("Demanda real y predicciones: estación Constitución")
-    st.caption(
-        "Serie de comparación exportada desde el notebook para la línea C, "
-        "del 6 al 12 de abril de 2026."
+with st.expander("Ranking de estaciones según el indicador seleccionado"):
+    ranking = demanda.merge(
+        estaciones[["LINEA", "ESTACION_BASE", "ESTACION_GEO"]].drop_duplicates(),
+        on=["LINEA", "ESTACION_BASE"],
+        how="left",
     )
-
-    opciones_modelos = {
-        "Regresión Lineal": "PRED_REGRESION_LINEAL",
-        "Random Forest": "PRED_RANDOM_FOREST",
-        "Gradient Boosting": "PRED_GRADIENT_BOOSTING",
-        "Baseline histórico": "PRED_BASELINE",
-    }
-    modelo_grafico = st.selectbox(
-        "Modelo para comparar",
-        options=list(opciones_modelos.keys()),
-        index=2,
-        key="modelo_grafico",
+    ranking = ranking.sort_values("VALOR_MAPA", ascending=False)
+    ranking = ranking.rename(columns={
+        "LINEA": "Línea",
+        "ESTACION_GEO": "Estación",
+        "VALOR_MAPA": "Valor",
+    })
+    st.dataframe(
+        ranking[["Línea", "Estación", "Valor"]],
+        use_container_width=True,
+        hide_index=True,
     )
-    columna_pred = opciones_modelos[modelo_grafico]
-
-    serie_grafico = df_serie[["FECHA_HORA", "PASAJEROS_REALES", columna_pred]].copy()
-    serie_grafico[columna_pred] = serie_grafico[columna_pred].clip(lower=0)
-    serie_grafico = serie_grafico.rename(columns={
-        "PASAJEROS_REALES": "Demanda real",
-        columna_pred: f"Predicción {modelo_grafico}",
-    }).set_index("FECHA_HORA")
-    st.line_chart(serie_grafico, height=390, use_container_width=True)
-
-    valores_reales = df_serie["PASAJEROS_REALES"].sum()
-    valores_predichos = df_serie[columna_pred].clip(lower=0).sum()
-    diferencia = valores_predichos - valores_reales
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Pasajeros reales (serie)", f"{valores_reales:,.0f}")
-    c2.metric(f"Pasajeros estimados ({modelo_grafico})", f"{valores_predichos:,.0f}")
-    c3.metric("Diferencia acumulada", f"{diferencia:+,.0f}")
-
-    with st.expander("Consultar registros de la serie comparativa"):
-        tabla_serie = df_serie[[
-            "FECHA_HORA", "PASAJEROS_REALES", columna_pred
-        ]].rename(columns={
-            "FECHA_HORA": "Fecha y hora",
-            "PASAJEROS_REALES": "Pasajeros reales",
-            columna_pred: f"Predicción {modelo_grafico}",
-        })
-        st.dataframe(tabla_serie, use_container_width=True, hide_index=True)
-
-st.divider()
-st.caption(
-    "Datos de pasajeros: resultados finales exportados desde el notebook del Grupo 13. "
-    "Cartografía: Buenos Aires Data / Subterráneos de Buenos Aires (SBASE), licencia CC-BY-2.5-AR. "
-    "Las predicciones corresponden al conjunto de prueba y no representan demanda en tiempo real."
-)
